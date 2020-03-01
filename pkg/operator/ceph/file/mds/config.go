@@ -18,11 +18,14 @@ package mds
 
 import (
 	"fmt"
+	"strconv"
 
 	apps "k8s.io/api/apps/v1"
 
+	"github.com/pkg/errors"
+	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -51,10 +54,10 @@ func (c *Cluster) generateKeyring(m *mdsConfig) (string, error) {
 	// Delete legacy key store for upgrade from Rook v0.9.x to v1.0.x
 	err = c.context.Clientset.CoreV1().Secrets(c.fs.Namespace).Delete(m.ResourceName, &metav1.DeleteOptions{})
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if kerrors.IsNotFound(err) {
 			logger.Debugf("legacy mds key %s is already removed", m.ResourceName)
 		} else {
-			logger.Warningf("legacy mds key %s could not be removed: %+v", m.ResourceName, err)
+			logger.Warningf("legacy mds key %q could not be removed. %v", m.ResourceName, err)
 		}
 	}
 
@@ -65,4 +68,30 @@ func (c *Cluster) generateKeyring(m *mdsConfig) (string, error) {
 func (c *Cluster) associateKeyring(existingKeyring string, d *apps.Deployment) error {
 	s := keyring.GetSecretStoreForDeployment(c.context, d)
 	return s.CreateOrUpdate(d.GetName(), existingKeyring)
+}
+
+func (c *Cluster) setDefaultFlagsMonConfigStore(mdsID string) error {
+	monStore := config.GetMonStore(c.context, c.fs.Namespace)
+	who := fmt.Sprintf("mds.%s", mdsID)
+	configOptions := make(map[string]string)
+
+	// Set mds cache memory limit to the best appropriate value
+	if !c.fs.Spec.MetadataServer.Resources.Limits.Memory().IsZero() {
+		mdsCacheMemoryLimit := float64(c.fs.Spec.MetadataServer.Resources.Limits.Memory().Value()) * mdsCacheMemoryLimitFactor
+		configOptions["mds_cache_memory_limit"] = strconv.Itoa(int(mdsCacheMemoryLimit))
+	}
+
+	// Set mds_join_fs flag to force mds daemon to join a specific fs
+	if c.clusterInfo.CephVersion.IsAtLeastOctopus() {
+		configOptions["mds_join_fs"] = c.fs.Name
+	}
+
+	for flag, val := range configOptions {
+		err := monStore.Set(who, flag, val)
+		if err != nil {
+			return errors.Wrapf(err, "failed to set %q to %q on %q", flag, val, who)
+		}
+	}
+
+	return nil
 }

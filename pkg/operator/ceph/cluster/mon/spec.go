@@ -21,8 +21,8 @@ import (
 	"os"
 	"path"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rook "github.com/rook/rook/pkg/apis/rook.io/v1alpha2"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
@@ -44,21 +44,28 @@ const (
 	monmapFile = "monmap"
 )
 
-func (c *Cluster) getLabels(daemonName string) map[string]string {
+func (c *Cluster) getLabels(daemonName string, canary bool, pvcName string) map[string]string {
 	// Mons have a service for each mon, so the additional pod data is relevant for its services
 	// Use pod labels to keep "mon: id" for legacy
 	labels := opspec.PodLabels(AppName, c.Namespace, "mon", daemonName)
 	// Add "mon_cluster: <namespace>" for legacy
 	labels[monClusterAttr] = c.Namespace
+	if canary {
+		labels["mon_canary"] = "true"
+	}
+	if pvcName != "" {
+		labels["pvc_name"] = pvcName
+	}
+
 	return labels
 }
 
-func (c *Cluster) makeDeployment(monConfig *monConfig) *apps.Deployment {
+func (c *Cluster) makeDeployment(monConfig *monConfig, canary bool) *apps.Deployment {
 	d := &apps.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      monConfig.ResourceName,
 			Namespace: c.Namespace,
-			Labels:    c.getLabels(monConfig.DaemonName),
+			Labels:    c.getLabels(monConfig.DaemonName, canary, ""),
 		},
 	}
 	k8sutil.AddRookVersionLabelToDeployment(d)
@@ -66,11 +73,11 @@ func (c *Cluster) makeDeployment(monConfig *monConfig) *apps.Deployment {
 	opspec.AddCephVersionLabelToDeployment(c.ClusterInfo.CephVersion, d)
 	k8sutil.SetOwnerRef(&d.ObjectMeta, &c.ownerRef)
 
-	pod := c.makeMonPod(monConfig)
+	pod := c.makeMonPod(monConfig, canary, "")
 	replicaCount := int32(1)
 	d.Spec = apps.DeploymentSpec{
 		Selector: &metav1.LabelSelector{
-			MatchLabels: c.getLabels(monConfig.DaemonName),
+			MatchLabels: c.getLabels(monConfig.DaemonName, canary, ""),
 		},
 		Template: v1.PodTemplateSpec{
 			ObjectMeta: pod.ObjectMeta,
@@ -85,14 +92,14 @@ func (c *Cluster) makeDeployment(monConfig *monConfig) *apps.Deployment {
 	return d
 }
 
-func (c *Cluster) makeDeploymentPVC(m *monConfig) (*v1.PersistentVolumeClaim, error) {
+func (c *Cluster) makeDeploymentPVC(m *monConfig, canary bool) (*v1.PersistentVolumeClaim, error) {
 	template := c.spec.Mon.VolumeClaimTemplate
 	volumeMode := v1.PersistentVolumeFilesystem
 	pvc := &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      m.ResourceName,
 			Namespace: c.Namespace,
-			Labels:    c.getLabels(m.DaemonName),
+			Labels:    c.getLabels(m.DaemonName, canary, m.ResourceName),
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{
@@ -131,53 +138,7 @@ func (c *Cluster) makeDeploymentPVC(m *monConfig) (*v1.PersistentVolumeClaim, er
 	return pvc, nil
 }
 
-/*
- * Pod spec
- */
-
-func (c *Cluster) setPodPlacement(pod *v1.PodSpec, p rook.Placement, nodeSelector map[string]string) {
-	p.ApplyToPodSpec(pod)
-	pod.NodeSelector = nodeSelector
-
-	// when a node selector is being used, skip the affinity business below
-	if nodeSelector != nil {
-		return
-	}
-
-	// label selector for monitors used in anti-affinity rules
-	monAntiAffinity := v1.PodAffinityTerm{
-		LabelSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				k8sutil.AppAttr: AppName,
-			},
-		},
-		TopologyKey: v1.LabelHostname,
-	}
-
-	// set monitor pod anti-affinity rules. when monitors should never be
-	// co-located (e.g. not AllowMultiplePerHost or HostNetworking) then the
-	// anti-affinity rule is made to be required during scheduling, otherwise it
-	// is merely a preferred policy.
-	//
-	// ApplyToPodSpec ensures that pod.Affinity is non-nil
-	if pod.Affinity.PodAntiAffinity == nil {
-		pod.Affinity.PodAntiAffinity = &v1.PodAntiAffinity{}
-	}
-	paa := pod.Affinity.PodAntiAffinity
-
-	if c.Network.IsHost() || !c.spec.Mon.AllowMultiplePerNode {
-		paa.RequiredDuringSchedulingIgnoredDuringExecution =
-			append(paa.RequiredDuringSchedulingIgnoredDuringExecution, monAntiAffinity)
-	} else {
-		paa.PreferredDuringSchedulingIgnoredDuringExecution =
-			append(paa.PreferredDuringSchedulingIgnoredDuringExecution, v1.WeightedPodAffinityTerm{
-				Weight:          50,
-				PodAffinityTerm: monAntiAffinity,
-			})
-	}
-}
-
-func (c *Cluster) makeMonPod(monConfig *monConfig) *v1.Pod {
+func (c *Cluster) makeMonPod(monConfig *monConfig, canary bool, PVCName string) *v1.Pod {
 	logger.Debugf("monConfig: %+v", monConfig)
 	podSpec := v1.PodSpec{
 		InitContainers: []v1.Container{
@@ -197,12 +158,16 @@ func (c *Cluster) makeMonPod(monConfig *monConfig) *v1.Pod {
 	if c.Network.IsHost() {
 		podSpec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
+	// Replace default unreachable node toleration
+	if c.spec.Mon.VolumeClaimTemplate != nil {
+		k8sutil.AddUnreachableNodeToleration(&podSpec)
+	}
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      monConfig.ResourceName,
 			Namespace: c.Namespace,
-			Labels:    c.getLabels(monConfig.DaemonName),
+			Labels:    c.getLabels(monConfig.DaemonName, canary, PVCName),
 		},
 		Spec: podSpec,
 	}
@@ -317,42 +282,43 @@ func (c *Cluster) makeMonDaemonContainer(monConfig *monConfig) v1.Container {
 			config.NewFlag("public-bind-addr", opspec.ContainerEnvVarReference(podIPEnvVar)))
 	}
 
-	// If deploying Nautilus and newer we need a new port of the monitor container
-	if c.ClusterInfo.CephVersion.IsAtLeastNautilus() {
-		addContainerPort(container, "msgr2", 3300)
-	}
+	// Add messenger 2 port
+	addContainerPort(container, "msgr2", 3300)
 
 	return container
 }
 
 // UpdateCephDeploymentAndWait verifies a deployment can be stopped or continued
-func UpdateCephDeploymentAndWait(context *clusterd.Context, deployment *apps.Deployment, namespace, daemonType, daemonName string, cephVersion cephver.CephVersion, isUpgrade, skipUpgradeChecks bool) error {
+func UpdateCephDeploymentAndWait(context *clusterd.Context, deployment *apps.Deployment, namespace, daemonType, daemonName string, cephVersion cephver.CephVersion, skipUpgradeChecks, continueUpgradeAfterChecksEvenIfNotHealthy bool) error {
 
 	callback := func(action string) error {
-		if !isUpgrade {
-			logger.Info("this is not an upgrade, not performing upgrade checks")
-			return nil
-		}
-
 		// At this point, we are in an upgrade
 		if skipUpgradeChecks {
-			logger.Warningf("this is an upgrade, not performing upgrade checks because skipUpgradeChecks is %t", skipUpgradeChecks)
+			logger.Warningf("this is a Ceph upgrade, not performing upgrade checks because skipUpgradeChecks is %t", skipUpgradeChecks)
 			return nil
 		}
 
 		logger.Infof("checking if we can %s the deployment %s", action, deployment.Name)
 
 		if action == "stop" {
-			err := client.OkToStop(context, namespace, deployment.Name, daemonType, daemonName, cephVersion)
+			err := client.OkToStop(context, namespace, deployment.Name, daemonType, daemonName)
 			if err != nil {
-				return fmt.Errorf("failed to check if we can %s the deployment %s: %+v", action, deployment.Name, err)
+				if continueUpgradeAfterChecksEvenIfNotHealthy {
+					logger.Infof("The %s daemon %s is not ok-to-stop but 'continueUpgradeAfterChecksEvenIfNotHealthy' is true, so proceeding to stop...", daemonType, daemonName)
+					return nil
+				}
+				return errors.Wrapf(err, "failed to check if we can %s the deployment %s", action, deployment.Name)
 			}
 		}
 
 		if action == "continue" {
 			err := client.OkToContinue(context, namespace, deployment.Name, daemonType, daemonName)
 			if err != nil {
-				return fmt.Errorf("failed to check if we can %s the deployment %s: %+v", action, deployment.Name, err)
+				if continueUpgradeAfterChecksEvenIfNotHealthy {
+					logger.Infof("The %s daemon %s is not ok-to-stop but 'continueUpgradeAfterChecksEvenIfNotHealthy' is true, so continuing...", daemonType, daemonName)
+					return nil
+				}
+				return errors.Wrapf(err, "failed to check if we can %s the deployment %s", action, deployment.Name)
 			}
 		}
 

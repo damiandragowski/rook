@@ -22,7 +22,7 @@ import (
 	"time"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rookalpha "github.com/rook/rook/pkg/apis/rook.io/v1alpha2"
+	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephconfig "github.com/rook/rook/pkg/daemon/ceph/config"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
@@ -42,7 +42,7 @@ func TestOrchestrationStatus(t *testing.T) {
 		CephVersion: cephver.Nautilus,
 	}
 	c := New(clusterInfo, &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}, "ns", "myversion", cephv1.CephVersionSpec{},
-		rookalpha.StorageScopeSpec{}, "", rookalpha.Placement{}, rookalpha.Annotations{}, cephv1.NetworkSpec{}, v1.ResourceRequirements{}, v1.ResourceRequirements{}, "my-priority-class", metav1.OwnerReference{}, false, false)
+		rookv1.StorageScopeSpec{}, "", rookv1.Placement{}, rookv1.Annotations{}, cephv1.NetworkSpec{}, v1.ResourceRequirements{}, v1.ResourceRequirements{}, "my-priority-class", metav1.OwnerReference{}, false, false)
 	kv := k8sutil.NewConfigMapKVStore(c.Namespace, clientset, metav1.OwnerReference{})
 	nodeName := "mynode"
 	cmName := fmt.Sprintf(orchestrationStatusMapName, nodeName)
@@ -82,11 +82,8 @@ func mockNodeOrchestrationCompletion(c *Cluster, nodeName string, statusMapWatch
 				status = &OrchestrationStatus{
 					OSDs: []OSDInfo{
 						{
-							ID:          1,
-							DataPath:    "/tmp",
-							Config:      "/foo/bar/ceph.conf",
-							Cluster:     "rook",
-							KeyringPath: "/foo/bar/key",
+							ID:      1,
+							Cluster: "rook",
 						},
 					},
 					Status: OrchestrationStatusCompleted,

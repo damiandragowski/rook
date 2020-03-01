@@ -18,14 +18,16 @@ package object
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	opspec "github.com/rook/rook/pkg/operator/ceph/spec"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -73,6 +75,9 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) v1.PodTemplateSpec 
 		HostNetwork:       c.clusterSpec.Network.IsHost(),
 		PriorityClassName: c.store.Spec.Gateway.PriorityClassName,
 	}
+	// Replace default unreachable node toleration
+	k8sutil.AddUnreachableNodeToleration(&podSpec)
+
 	if c.clusterSpec.Network.IsHost() {
 		podSpec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
@@ -91,7 +96,9 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) v1.PodTemplateSpec 
 					}}}}
 		podSpec.Volumes = append(podSpec.Volumes, certVol)
 	}
-	c.store.Spec.Gateway.Placement.ApplyToPodSpec(&podSpec)
+	preferredDuringScheduling := false
+	k8sutil.SetNodeAntiAffinityForPod(&podSpec, c.store.Spec.Gateway.Placement, c.clusterSpec.Network.IsHost(), preferredDuringScheduling, c.getLabels(),
+		nil)
 
 	podTemplateSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -125,12 +132,12 @@ func (c *clusterConfig) makeDaemonContainer(rgwConfig *rgwConfig) v1.Container {
 		},
 		Args: append(
 			append(
-				opspec.DaemonFlags(c.clusterInfo, c.store.Name),
+				opspec.DaemonFlags(c.clusterInfo, strings.TrimPrefix(generateCephXUser(rgwConfig.ResourceName), "client.")),
 				"--foreground",
-				cephconfig.NewFlag("name", generateCephXUser(rgwConfig.ResourceName)),
+				cephconfig.NewFlag("rgw frontends", fmt.Sprintf("%s %s", rgwFrontendName, c.portString())),
 				cephconfig.NewFlag("host", opspec.ContainerEnvVarReference("POD_NAME")),
 				cephconfig.NewFlag("rgw-mime-types-file", mimeTypesMountPath()),
-			), c.defaultFlags()..., // use default settings as flags until mon kv store supported
+			),
 		),
 		VolumeMounts: append(
 			opspec.DaemonVolumeMounts(c.DataPathMap, rgwConfig.ResourceName),
@@ -141,7 +148,7 @@ func (c *clusterConfig) makeDaemonContainer(rgwConfig *rgwConfig) v1.Container {
 		LivenessProbe: &v1.Probe{
 			Handler: v1.Handler{
 				HTTPGet: &v1.HTTPGetAction{
-					Path: "/",
+					Path: "/swift/healthcheck",
 					Port: intstr.FromInt(int(c.store.Spec.Gateway.Port)),
 				},
 			},
@@ -181,12 +188,12 @@ func (c *clusterConfig) startService() (string, error) {
 
 	svc, err := c.context.Clientset.CoreV1().Services(c.store.Namespace).Create(svc)
 	if err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("failed to create rgw service. %+v", err)
+		if !kerrors.IsAlreadyExists(err) {
+			return "", errors.Wrapf(err, "failed to create rgw service")
 		}
 		svc, err = c.context.Clientset.CoreV1().Services(c.store.Namespace).Get(c.instanceName(), metav1.GetOptions{})
 		if err != nil {
-			return "", fmt.Errorf("failed to get existing service IP. %+v", err)
+			return "", errors.Wrapf(err, "failed to get existing service IP")
 		}
 		return svc.Spec.ClusterIP, nil
 	}

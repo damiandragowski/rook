@@ -22,9 +22,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
 	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -43,30 +43,10 @@ caps osd = "allow rwx"
 )
 
 var (
-	rgwFrontendName = "civetweb"
+	rgwFrontendName = "beast"
 )
 
-func rgwFrontend(v cephver.CephVersion) string {
-	if v.IsAtLeastNautilus() {
-		rgwFrontendName = "beast"
-	}
-
-	return rgwFrontendName
-}
-
-// TODO: these should be set in the mon's central kv store for mimic+
-func (c *clusterConfig) defaultFlags() []string {
-	return []string{
-		cephconfig.NewFlag("rgw log nonexistent bucket", "true"),
-		cephconfig.NewFlag("rgw intent log object name utc", "true"),
-		cephconfig.NewFlag("rgw enable usage log", "true"),
-		cephconfig.NewFlag("rgw frontends", fmt.Sprintf("%s %s", rgwFrontend(c.clusterInfo.CephVersion), c.portString(c.clusterInfo.CephVersion))),
-		cephconfig.NewFlag("rgw zone", c.store.Name),
-		cephconfig.NewFlag("rgw zonegroup", c.store.Name),
-	}
-}
-
-func (c *clusterConfig) portString(v cephver.CephVersion) string {
+func (c *clusterConfig) portString() string {
 	var portString string
 
 	port := c.store.Spec.Gateway.Port
@@ -77,28 +57,12 @@ func (c *clusterConfig) portString(v cephver.CephVersion) string {
 		certPath := path.Join(certDir, certFilename)
 		// This is the beast backend
 		// Config is: http://docs.ceph.com/docs/master/radosgw/frontends/#id3
-		if v.IsAtLeastNautilus() {
-			if port != 0 {
-				portString = fmt.Sprintf("%s ssl_port=%d ssl_certificate=%s",
-					portString, c.store.Spec.Gateway.SecurePort, certPath)
-			} else {
-				portString = fmt.Sprintf("ssl_port=%d ssl_certificate=%s",
-					c.store.Spec.Gateway.SecurePort, certPath)
-			}
+		if port != 0 {
+			portString = fmt.Sprintf("%s ssl_port=%d ssl_certificate=%s",
+				portString, c.store.Spec.Gateway.SecurePort, certPath)
 		} else {
-			// This is civetweb config
-			// Config is http://docs.ceph.com/docs/master/radosgw/frontends/#id5
-			var separator string
-			if port != 0 {
-				separator = "+"
-			} else {
-				// This means there is only one port and it's a secured one
-				portString = "port="
-			}
-			// with ssl enabled, the port number must end with the letter s.
-			// e.g., "443s ssl_certificate=/etc/ceph/private/keyandcert.pem"
-			portString = fmt.Sprintf("%s%s%ds ssl_certificate=%s",
-				portString, separator, c.store.Spec.Gateway.SecurePort, certPath)
+			portString = fmt.Sprintf("ssl_port=%d ssl_certificate=%s",
+				c.store.Spec.Gateway.SecurePort, certPath)
 		}
 	}
 	return portString
@@ -106,7 +70,7 @@ func (c *clusterConfig) portString(v cephver.CephVersion) string {
 
 func generateCephXUser(name string) string {
 	user := strings.TrimPrefix(name, AppName)
-	return "client" + strings.Replace(user, "-", ".", -1)
+	return "client.rgw" + strings.Replace(user, "-", ".", -1)
 }
 
 func (c *clusterConfig) generateKeyring(rgwConfig *rgwConfig) (string, error) {
@@ -130,4 +94,25 @@ func (c *clusterConfig) associateKeyring(existingKeyring string, ownerRef *metav
 	s := keyring.GetSecretStore(c.context, c.store.Namespace, ownerRef)
 
 	return s.CreateOrUpdate(resourceName, existingKeyring)
+}
+
+func (c *clusterConfig) setDefaultFlagsMonConfigStore(rgwName string) error {
+	monStore := cephconfig.GetMonStore(c.context, c.store.Namespace)
+	who := generateCephXUser(rgwName)
+	configOptions := make(map[string]string)
+
+	configOptions["rgw_log_nonexistent_bucket"] = "true"
+	configOptions["rgw_log_object_name_utc"] = "true"
+	configOptions["rgw_enable_usage_log"] = "true"
+	configOptions["rgw_zone"] = c.store.Name
+	configOptions["rgw_zonegroup"] = c.store.Name
+
+	for flag, val := range configOptions {
+		err := monStore.Set(who, flag, val)
+		if err != nil {
+			return errors.Wrapf(err, "failed to set %q to %q on %q", flag, val, who)
+		}
+	}
+
+	return nil
 }

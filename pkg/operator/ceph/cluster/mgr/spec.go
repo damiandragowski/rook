@@ -22,16 +22,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
 	rookcephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rookalpha "github.com/rook/rook/pkg/apis/rook.io/v1alpha2"
+	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	opspec "github.com/rook/rook/pkg/operator/ceph/spec"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-	rookversion "github.com/rook/rook/pkg/version"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +42,7 @@ const (
 )
 
 func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) *apps.Deployment {
+	logger.Debugf("mgrConfig: %+v", mgrConfig)
 	podSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   mgrConfig.ResourceName,
@@ -63,21 +63,17 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) *apps.Deployment {
 		},
 	}
 
-	// if the fix is needed, then the following init containers are created
-	// which explicitly configure the server_addr Ceph configuration option to
-	// be equal to the pod's IP address. Note that when the fix is not needed,
-	// there is additional work done to clear fixes after upgrades. See
-	// clearHttpBindFix() method for more details.
-	if c.needHTTPBindFix() {
-		podSpec.Spec.InitContainers = append(podSpec.Spec.InitContainers, []v1.Container{
-			c.makeSetServerAddrInitContainer(mgrConfig, "dashboard"),
-			c.makeSetServerAddrInitContainer(mgrConfig, "prometheus"),
-		}...)
-		// ceph config set commands want admin keyring
-		podSpec.Spec.Volumes = append(podSpec.Spec.Volumes,
-			keyring.Volume().Admin())
-	}
+	// Replace default unreachable node toleration
+	k8sutil.AddUnreachableNodeToleration(&podSpec.Spec)
 
+	podSpec.Spec.InitContainers = append(podSpec.Spec.InitContainers, []v1.Container{
+		c.makeSetServerAddrInitContainer(mgrConfig, "dashboard"),
+		c.makeSetServerAddrInitContainer(mgrConfig, "prometheus"),
+	}...)
+
+	// ceph config set commands want admin keyring
+	podSpec.Spec.Volumes = append(podSpec.Spec.Volumes,
+		keyring.Volume().Admin())
 	if c.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
@@ -110,23 +106,6 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) *apps.Deployment {
 	return d
 }
 
-func (c *Cluster) needHTTPBindFix() bool {
-	needed := true
-
-	// if mimic and >= 13.2.6
-	if c.clusterInfo.CephVersion.IsMimic() &&
-		c.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 13, Minor: 2, Extra: 6}) {
-		needed = false
-	}
-
-	// if >= 14.1.1
-	if c.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 14, Minor: 1, Extra: 1}) {
-		needed = false
-	}
-
-	return needed
-}
-
 // if we do not need the http bind fix, then we need to be careful. if we are
 // upgrading from a cluster that had the fix applied, then the fix is no longer
 // needed, and furthermore, needs to be removed so that there is not a lingering
@@ -146,14 +125,16 @@ func (c *Cluster) clearHTTPBindFix() error {
 			// there are two forms of the configuration key that might exist which
 			// depends not on the current version, but on the version that may be
 			// the version being upgraded from.
-			for _, ver := range []cephver.CephVersion{cephver.Mimic} {
-				client.MgrSetConfig(c.context, c.Namespace, daemonID, ver,
-					fmt.Sprintf("mgr/%s/server_addr", module), "", false)
+			if _, err := client.MgrSetConfig(c.context, c.Namespace, daemonID,
+				fmt.Sprintf("mgr/%s/server_addr", module), "", false); err != nil {
+				return errors.Wrapf(err, "failed to set config for an mgr daemon using v2 format.")
+			}
 
-				// this is for the format used in v1.0
-				// https://github.com/rook/rook/commit/11d318fb2f77a6ac9a8f2b9be42c826d3b4a93c3
-				client.MgrSetConfig(c.context, c.Namespace, daemonID, ver,
-					fmt.Sprintf("mgr/%s/%s/server_addr", module, daemonID), "", false)
+			// this is for the format used in v1.0
+			// https://github.com/rook/rook/commit/11d318fb2f77a6ac9a8f2b9be42c826d3b4a93c3
+			if _, err := client.MgrSetConfig(c.context, c.Namespace, daemonID,
+				fmt.Sprintf("mgr/%s/%s/server_addr", module, daemonID), "", false); err != nil {
+				return errors.Wrapf(err, "failed to set config for an mgr daemon using v1 format.")
 			}
 		}
 	}
@@ -180,9 +161,7 @@ func (c *Cluster) makeSetServerAddrInitContainer(mgrConfig *mgrConfig, mgrModule
 	cfgSetArgs = append(cfgSetArgs, fmt.Sprintf("mgr.%s", mgrConfig.DaemonID))
 	cfgPath := fmt.Sprintf("mgr/%s/%s/server_addr", mgrModule, mgrConfig.DaemonID)
 	cfgSetArgs = append(cfgSetArgs, cfgPath, opspec.ContainerEnvVarReference(podIPEnvVar))
-	if c.clusterInfo.CephVersion.IsAtLeastNautilus() {
-		cfgSetArgs = append(cfgSetArgs, "--force")
-	}
+	cfgSetArgs = append(cfgSetArgs, "--force")
 	cfgSetArgs = append(cfgSetArgs, "--verbose")
 
 	container := v1.Container{
@@ -332,17 +311,15 @@ func (c *Cluster) getPodLabels(daemonName string) map[string]string {
 	return labels
 }
 
-func (c *Cluster) applyPrometheusAnnotations(objectMeta *metav1.ObjectMeta) error {
+func (c *Cluster) applyPrometheusAnnotations(objectMeta *metav1.ObjectMeta) {
 	if len(c.annotations) == 0 {
-		t := rookalpha.Annotations{
+		t := rookv1.Annotations{
 			"prometheus.io/scrape": "true",
 			"prometheus.io/port":   strconv.Itoa(metricsPort),
 		}
 
 		t.ApplyToObjectMeta(objectMeta)
 	}
-
-	return nil
 }
 
 func (c *Cluster) cephMgrOrchestratorModuleEnvs() []v1.EnvVar {
@@ -350,7 +327,6 @@ func (c *Cluster) cephMgrOrchestratorModuleEnvs() []v1.EnvVar {
 	envVars := []v1.EnvVar{
 		{Name: "ROOK_OPERATOR_NAMESPACE", Value: operatorNamespace},
 		{Name: "ROOK_CEPH_CLUSTER_CRD_VERSION", Value: rookcephv1.Version},
-		{Name: "ROOK_VERSION", Value: rookversion.Version},
 		{Name: "ROOK_CEPH_CLUSTER_CRD_NAME", Value: c.clusterInfo.Name},
 		k8sutil.PodIPEnvVar(podIPEnvVar),
 	}

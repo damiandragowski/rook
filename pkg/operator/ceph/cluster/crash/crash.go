@@ -22,38 +22,39 @@ import (
 	"path"
 	"reflect"
 
-	opkit "github.com/rook/operator-kit"
+	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	opspec "github.com/rook/rook/pkg/operator/ceph/spec"
+	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-
-	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+const (
+	crashCollectorKeyringUsername = "client.crash"
+	crashCollectorKeyName         = "rook-ceph-crash-collector-keyring"
 )
 
 // ClusterResource operator-kit Custom Resource Definition
-var clusterResource = opkit.CustomResource{
+var clusterResource = k8sutil.CustomResource{
 	Group:   cephv1.CustomResourceGroup,
 	Version: cephv1.Version,
-	Scope:   apiextensionsv1beta1.NamespaceScoped,
 	Kind:    reflect.TypeOf(cephv1.CephCluster{}).Name(),
 }
 
 // createOrUpdateCephCrash is a wrapper around controllerutil.CreateOrUpdate
-func (r *ReconcileNode) createOrUpdateCephCrash(node corev1.Node, tolerations []corev1.Toleration, cephCluster cephv1.CephCluster) (controllerutil.OperationResult, error) {
+func (r *ReconcileNode) createOrUpdateCephCrash(node corev1.Node, tolerations []corev1.Toleration, cephCluster cephv1.CephCluster, cephVersion *version.CephVersion) (controllerutil.OperationResult, error) {
 	// Create or Update the deployment default/foo
 	nodeHostnameLabel, ok := node.ObjectMeta.Labels[corev1.LabelHostname]
 	if !ok {
-		return controllerutil.OperationResultNone, fmt.Errorf("label key %q does not exist on node %q", corev1.LabelHostname, node.GetName())
+		return controllerutil.OperationResultNone, errors.Errorf("label key %q does not exist on node %q", corev1.LabelHostname, node.GetName())
 	}
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -62,6 +63,9 @@ func (r *ReconcileNode) createOrUpdateCephCrash(node corev1.Node, tolerations []
 			OwnerReferences: []metav1.OwnerReference{clusterOwnerRef(cephCluster.GetName(), string(cephCluster.GetUID()))},
 		},
 	}
+
+	volumes := opspec.DaemonVolumesBase(config.NewDatalessDaemonDataPathMap(cephCluster.GetNamespace(), cephCluster.Spec.DataDirHostPath), "")
+	volumes = append(volumes, keyring.Volume().CrashCollector())
 
 	mutateFunc := func() error {
 
@@ -74,17 +78,27 @@ func (r *ReconcileNode) createOrUpdateCephCrash(node corev1.Node, tolerations []
 		deploymentLabels[string(config.CrashType)] = "crash"
 		deploymentLabels["ceph_daemon_id"] = "crash"
 
+		selectorLabels := map[string]string{
+			corev1.LabelHostname: nodeHostnameLabel,
+			k8sutil.AppAttr:      AppName,
+			NodeNameLabel:        node.GetName(),
+		}
+
 		nodeSelector := map[string]string{corev1.LabelHostname: nodeHostnameLabel}
 
 		// Deployment selector is immutable so we set this value only if
 		// a new object is going to be created
 		if deploy.ObjectMeta.CreationTimestamp.IsZero() {
 			deploy.Spec.Selector = &metav1.LabelSelector{
-				MatchLabels: deploymentLabels,
+				MatchLabels: selectorLabels,
 			}
 		}
 
 		deploy.ObjectMeta.Labels = deploymentLabels
+		k8sutil.AddRookVersionLabelToDeployment(deploy)
+		if cephVersion != nil {
+			opspec.AddCephVersionLabelToDeployment(*cephVersion, deploy)
+		}
 		deploy.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: deploymentLabels,
@@ -96,12 +110,12 @@ func (r *ReconcileNode) createOrUpdateCephCrash(node corev1.Node, tolerations []
 					getCrashChownInitContainer(cephCluster),
 				},
 				Containers: []corev1.Container{
-					getCrashDaemonContainer(cephCluster),
+					getCrashDaemonContainer(cephCluster, *cephVersion),
 				},
 				Tolerations:   tolerations,
 				RestartPolicy: corev1.RestartPolicyAlways,
 				HostNetwork:   cephCluster.Spec.Network.IsHost(),
-				Volumes:       append(opspec.DaemonVolumesBase(config.NewDatalessDaemonDataPathMap(cephCluster.GetNamespace(), cephCluster.Spec.DataDirHostPath), ""), keyring.Volume().Admin()),
+				Volumes:       volumes,
 			},
 		}
 
@@ -140,15 +154,17 @@ func getCrashChownInitContainer(cephCluster cephv1.CephCluster) corev1.Container
 		cephCluster.Spec.CephVersion.Image,
 		opspec.DaemonVolumeMounts(dataPathMap, ""),
 		cephv1.GetCrashCollectorResources(cephCluster.Spec.Resources),
-		&corev1.SecurityContext{},
+		mon.PodSecurityContext(),
 	)
 }
 
-func getCrashDaemonContainer(cephCluster cephv1.CephCluster) corev1.Container {
+func getCrashDaemonContainer(cephCluster cephv1.CephCluster, cephVersion version.CephVersion) corev1.Container {
 	cephImage := cephCluster.Spec.CephVersion.Image
 	dataPathMap := config.NewDatalessDaemonDataPathMap(cephCluster.GetNamespace(), cephCluster.Spec.DataDirHostPath)
-	crashEnvVar := corev1.EnvVar{Name: "CEPH_ARGS", Value: "-m $(ROOK_CEPH_MON_HOST) -k /etc/ceph/admin-keyring-store/keyring -n client.admin"}
+	crashEnvVar := generateCrashEnvVar()
 	envVars := append(opspec.DaemonEnvVars(cephImage), crashEnvVar)
+	volumeMounts := opspec.DaemonVolumeMounts(dataPathMap, "")
+	volumeMounts = append(volumeMounts, keyring.VolumeMount().CrashCollector())
 
 	container := corev1.Container{
 		Name: "ceph-crash",
@@ -157,7 +173,7 @@ func getCrashDaemonContainer(cephCluster cephv1.CephCluster) corev1.Container {
 		},
 		Image:        cephImage,
 		Env:          envVars,
-		VolumeMounts: append(opspec.DaemonVolumeMounts(dataPathMap, ""), keyring.VolumeMount().Admin()),
+		VolumeMounts: volumeMounts,
 		Resources:    cephv1.GetCrashCollectorResources(cephCluster.Spec.Resources),
 	}
 
@@ -173,4 +189,11 @@ func clusterOwnerRef(clusterName, clusterID string) metav1.OwnerReference {
 		UID:                types.UID(clusterID),
 		BlockOwnerDeletion: &blockOwner,
 	}
+}
+
+func generateCrashEnvVar() corev1.EnvVar {
+	val := fmt.Sprintf("-m $(ROOK_CEPH_MON_HOST) -k %s", keyring.VolumeMount().CrashCollectorKeyringFilePath())
+	env := corev1.EnvVar{Name: "CEPH_ARGS", Value: val}
+
+	return env
 }

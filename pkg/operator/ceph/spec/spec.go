@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"github.com/coreos/pkg/capnslog"
+	"github.com/pkg/errors"
 	cephconfig "github.com/rook/rook/pkg/daemon/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
@@ -325,7 +326,7 @@ func CheckPodMemory(resources v1.ResourceRequirements, cephPodMinimumMemory uint
 	if !podMemoryLimit.IsZero() {
 		// This means LIMIT and REQUEST are either identical or different but still we use LIMIT as a reference
 		if uint64(podMemoryLimit.Value()) < display.MbTob(cephPodMinimumMemory) {
-			return fmt.Errorf(errorMessage, display.BToMb(uint64(podMemoryLimit.Value())), cephPodMinimumMemory)
+			return errors.Errorf(errorMessage, display.BToMb(uint64(podMemoryLimit.Value())), cephPodMinimumMemory)
 		}
 
 		// This means LIMIT < REQUEST
@@ -335,7 +336,7 @@ func CheckPodMemory(resources v1.ResourceRequirements, cephPodMinimumMemory uint
 			User has specified a pod memory limit %dmb below the pod memory request %dmb in the cluster CR.\n
 			Rook will create pods that are expected to fail to serve as a more apparent error indicator to the user.`
 
-			return fmt.Errorf(extraErrorLine, display.BToMb(uint64(podMemoryLimit.Value())), display.BToMb(uint64(podMemoryRequest.Value())))
+			return errors.Errorf(extraErrorLine, display.BToMb(uint64(podMemoryLimit.Value())), display.BToMb(uint64(podMemoryRequest.Value())))
 		}
 	}
 
@@ -374,6 +375,49 @@ func ChownCephDataDirsInitContainer(
 		Args:            args,
 		Image:           containerImage,
 		VolumeMounts:    volumeMounts,
+		Resources:       resources,
+		SecurityContext: securityContext,
+	}
+}
+
+// GenerateMinimalCephConfInitContainer returns an init container that will generate the most basic
+// Ceph config for connecting non-Ceph daemons to a Ceph cluster (e.g., nfs-ganesha). Effectively
+// what this means is that it generates '/etc/ceph/ceph.conf' with 'mon_host' populated and a
+// keyring path associated with the user given. 'mon_host' is determined by the 'ROOK_CEPH_MON_HOST'
+// env var present in other Ceph daemon pods, and the keyring is expected to be mounted into the
+// container with a Kubernetes pod volume+mount.
+func GenerateMinimalCephConfInitContainer(
+	username, keyringPath string,
+	containerImage string,
+	volumeMounts []v1.VolumeMount,
+	resources v1.ResourceRequirements,
+	securityContext *v1.SecurityContext,
+) v1.Container {
+	cfgPath := cephconfig.DefaultConfigFilePath()
+	// Note that parameters like $(PARAM) will be replaced by Kubernetes with env var content before
+	// container creation.
+	confScript := `
+set -xEeuo pipefail
+
+cat << EOF > ` + cfgPath + `
+[global]
+mon_host = $(ROOK_CEPH_MON_HOST)
+
+[` + username + `]
+keyring = ` + keyringPath + `
+EOF
+
+chmod 444 ` + cfgPath + `
+
+cat ` + cfgPath + `
+`
+	return v1.Container{
+		Name:            "generate-minimal-ceph-conf",
+		Command:         []string{"/bin/bash", "-c", confScript},
+		Args:            []string{},
+		Image:           containerImage,
+		VolumeMounts:    volumeMounts,
+		Env:             config.StoredMonHostEnvVars(),
 		Resources:       resources,
 		SecurityContext: securityContext,
 	}

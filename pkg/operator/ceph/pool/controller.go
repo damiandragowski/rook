@@ -18,17 +18,17 @@ limitations under the License.
 package pool
 
 import (
-	"fmt"
 	"reflect"
 
 	"github.com/coreos/pkg/capnslog"
-	opkit "github.com/rook/operator-kit"
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	ceph "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephconfig "github.com/rook/rook/pkg/daemon/ceph/config"
 	"github.com/rook/rook/pkg/daemon/ceph/model"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -41,12 +41,11 @@ const (
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-pool")
 
 // PoolResource represents the Pool custom resource object
-var PoolResource = opkit.CustomResource{
+var PoolResource = k8sutil.CustomResource{
 	Name:    "cephblockpool",
 	Plural:  "cephblockpools",
 	Group:   cephv1.CustomResourceGroup,
 	Version: cephv1.Version,
-	Scope:   apiextensionsv1beta1.NamespaceScoped,
 	Kind:    reflect.TypeOf(cephv1.CephBlockPool{}).Name(),
 }
 
@@ -65,7 +64,7 @@ func NewPoolController(context *clusterd.Context, clusterSpec *cephv1.ClusterSpe
 }
 
 // Watch watches for instances of Pool custom resources and acts on them
-func (c *PoolController) StartWatch(namespace string, stopCh chan struct{}) error {
+func (c *PoolController) StartWatch(namespace string, stopCh chan struct{}) {
 
 	resourceHandlerFuncs := cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.onAdd,
@@ -74,9 +73,7 @@ func (c *PoolController) StartWatch(namespace string, stopCh chan struct{}) erro
 	}
 
 	logger.Infof("start watching pools in namespace %q", namespace)
-	watcher := opkit.NewWatcher(PoolResource, namespace, resourceHandlerFuncs, c.context.RookClientset.CephV1().RESTClient())
-	go watcher.Watch(&cephv1.CephBlockPool{}, stopCh)
-	return nil
+	go k8sutil.WatchCR(PoolResource, namespace, resourceHandlerFuncs, c.context.RookClientset.CephV1().RESTClient(), &cephv1.CephBlockPool{}, stopCh)
 }
 
 func (c *PoolController) onAdd(obj interface{}) {
@@ -87,14 +84,17 @@ func (c *PoolController) onAdd(obj interface{}) {
 
 	pool, err := getPoolObject(obj)
 	if err != nil {
-		logger.Errorf("failed to get pool object: %+v", err)
+		logger.Errorf("failed to get pool object. %v", err)
 		return
 	}
-
+	updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.ProcessingStatus, c.context)
 	err = createPool(c.context, pool)
 	if err != nil {
-		logger.Errorf("failed to create pool %s. %+v", pool.ObjectMeta.Name, err)
+		logger.Errorf("failed to create pool %q. %v", pool.ObjectMeta.Name, err)
+		updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.FailedStatus, c.context)
+		return
 	}
+	updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.ReadyStatus, c.context)
 }
 
 func (c *PoolController) onUpdate(oldObj, newObj interface{}) {
@@ -105,33 +105,39 @@ func (c *PoolController) onUpdate(oldObj, newObj interface{}) {
 
 	oldPool, err := getPoolObject(oldObj)
 	if err != nil {
-		logger.Errorf("failed to get old pool object: %+v", err)
+		logger.Errorf("failed to get old pool object. %v", err)
 		return
 	}
 	pool, err := getPoolObject(newObj)
 	if err != nil {
-		logger.Errorf("failed to get new pool object: %+v", err)
+		logger.Errorf("failed to get new pool object. %v", err)
 		return
 	}
 
 	if oldPool.Name != pool.Name {
-		logger.Errorf("failed to update pool %s. name update not allowed", pool.Name)
+		logger.Errorf("failed to update pool %q. name update not allowed", pool.Name)
+		updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.FailedStatus, c.context)
 		return
 	}
-	if pool.Spec.ErasureCoded.CodingChunks != 0 && pool.Spec.ErasureCoded.DataChunks != 0 {
-		logger.Errorf("failed to update pool %s. erasurecoded update not allowed", pool.Name)
+	if oldPool.Spec.ErasureCoded.CodingChunks != pool.Spec.ErasureCoded.CodingChunks || oldPool.Spec.ErasureCoded.DataChunks != pool.Spec.ErasureCoded.DataChunks {
+		logger.Errorf("failed to update pool %q. erasurecoded update not allowed", pool.Name)
+		updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.FailedStatus, c.context)
 		return
 	}
 	if !poolChanged(oldPool.Spec, pool.Spec) {
-		logger.Debugf("pool %s not changed", pool.Name)
+		logger.Debugf("pool %q not changed", pool.Name)
 		return
 	}
+	updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.ProcessingStatus, c.context)
 
 	// if the pool is modified, allow the pool to be created if it wasn't already
-	logger.Infof("updating pool %s", pool.Name)
+	logger.Infof("updating pool %q", pool.Name)
 	if err := createPool(c.context, pool); err != nil {
-		logger.Errorf("failed to create (modify) pool %s. %+v", pool.ObjectMeta.Name, err)
+		logger.Errorf("failed to create (modify) pool %q. %v", pool.ObjectMeta.Name, err)
+		updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.FailedStatus, c.context)
+		return
 	}
+	updateCephBlockPoolStatus(pool.GetName(), pool.GetNamespace(), k8sutil.ReadyStatus, c.context)
 }
 
 // ParentClusterChanged determines wether or not a CR update has been sent
@@ -155,11 +161,11 @@ func (c *PoolController) onDelete(obj interface{}) {
 
 	pool, err := getPoolObject(obj)
 	if err != nil {
-		logger.Errorf("failed to get pool object: %+v", err)
+		logger.Errorf("failed to get pool object. %v", err)
 		return
 	}
 	if err := deletePool(c.context, pool); err != nil {
-		logger.Errorf("failed to delete pool %s. %+v", pool.ObjectMeta.Name, err)
+		logger.Errorf("failed to delete pool %q. %v", pool.ObjectMeta.Name, err)
 	}
 }
 
@@ -167,16 +173,16 @@ func (c *PoolController) onDelete(obj interface{}) {
 func createPool(context *clusterd.Context, p *cephv1.CephBlockPool) error {
 	// validate the pool settings
 	if err := ValidatePool(context, p); err != nil {
-		return fmt.Errorf("invalid pool %s arguments. %+v", p.Name, err)
+		return errors.Wrapf(err, "invalid pool %q arguments", p.Name)
 	}
 
 	// create the pool
-	logger.Infof("creating pool %s in namespace %s", p.Name, p.Namespace)
+	logger.Infof("creating pool %q in namespace %q", p.Name, p.Namespace)
 	if err := ceph.CreatePoolWithProfile(context, p.Namespace, *p.Spec.ToModel(p.Name), poolApplicationNameRBD); err != nil {
-		return fmt.Errorf("failed to create pool %s. %+v", p.Name, err)
+		return errors.Wrapf(err, "failed to create pool %q", p.Name)
 	}
 
-	logger.Infof("created pool %s", p.Name)
+	logger.Infof("created pool %q", p.Name)
 	return nil
 }
 
@@ -184,7 +190,7 @@ func createPool(context *clusterd.Context, p *cephv1.CephBlockPool) error {
 func deletePool(context *clusterd.Context, p *cephv1.CephBlockPool) error {
 
 	if err := ceph.DeletePool(context, p.Namespace, p.Name); err != nil {
-		return fmt.Errorf("failed to delete pool '%s'. %+v", p.Name, err)
+		return errors.Wrapf(err, "failed to delete pool %q", p.Name)
 	}
 
 	return nil
@@ -218,10 +224,10 @@ func ModelToSpec(pool model.Pool) cephv1.PoolSpec {
 // Validate the pool arguments
 func ValidatePool(context *clusterd.Context, p *cephv1.CephBlockPool) error {
 	if p.Name == "" {
-		return fmt.Errorf("missing name")
+		return errors.New("missing name")
 	}
 	if p.Namespace == "" {
-		return fmt.Errorf("missing namespace")
+		return errors.New("missing namespace")
 	}
 	if err := ValidatePoolSpec(context, p.Namespace, &p.Spec); err != nil {
 		return err
@@ -232,7 +238,7 @@ func ValidatePool(context *clusterd.Context, p *cephv1.CephBlockPool) error {
 // ValidatePoolSpec validates the Ceph block pool spec CR
 func ValidatePoolSpec(context *clusterd.Context, namespace string, p *cephv1.PoolSpec) error {
 	if p.Replication() != nil && p.ErasureCode() != nil {
-		return fmt.Errorf("both replication and erasure code settings cannot be specified")
+		return errors.New("both replication and erasure code settings cannot be specified")
 	}
 
 	var crush ceph.CrushMap
@@ -240,7 +246,7 @@ func ValidatePoolSpec(context *clusterd.Context, namespace string, p *cephv1.Poo
 	if p.FailureDomain != "" || p.CrushRoot != "" {
 		crush, err = ceph.GetCrushMap(context, namespace)
 		if err != nil {
-			return fmt.Errorf("failed to get crush map. %+v", err)
+			return errors.Wrapf(err, "failed to get crush map")
 		}
 	}
 
@@ -254,7 +260,7 @@ func ValidatePoolSpec(context *clusterd.Context, namespace string, p *cephv1.Poo
 			}
 		}
 		if !found {
-			return fmt.Errorf("unrecognized failure domain %s", p.FailureDomain)
+			return errors.Errorf("unrecognized failure domain %s", p.FailureDomain)
 		}
 	}
 
@@ -268,8 +274,13 @@ func ValidatePoolSpec(context *clusterd.Context, namespace string, p *cephv1.Poo
 			}
 		}
 		if !found {
-			return fmt.Errorf("unrecognized crush root %s", p.CrushRoot)
+			return errors.Errorf("unrecognized crush root %s", p.CrushRoot)
 		}
+	}
+
+	// validate pool replica size
+	if p.Replicated.Size == 1 && p.Replicated.RequireSafeReplicaSize {
+		return errors.Errorf("error pool size is %d and requireSafeReplicaSize is %t, must be false", p.Replicated.Size, p.Replicated.RequireSafeReplicaSize)
 	}
 
 	return nil
@@ -283,5 +294,24 @@ func getPoolObject(obj interface{}) (pool *cephv1.CephBlockPool, err error) {
 		return pool.DeepCopy(), nil
 	}
 
-	return nil, fmt.Errorf("not a known pool object: %+v", obj)
+	return nil, errors.Errorf("not a known pool object %+v", obj)
+}
+
+func updateCephBlockPoolStatus(name, namespace, status string, context *clusterd.Context) {
+	updatedCephBlockPool, err := context.RookClientset.CephV1().CephBlockPools(namespace).Get(name, metav1.GetOptions{})
+	if err != nil {
+		logger.Errorf("Unable to update the cephBlockPool %s status %v", updatedCephBlockPool.GetName(), err)
+		return
+	}
+	if updatedCephBlockPool.Status == nil {
+		updatedCephBlockPool.Status = &cephv1.Status{}
+	} else if updatedCephBlockPool.Status.Phase == status {
+		return
+	}
+	updatedCephBlockPool.Status.Phase = status
+	_, err = context.RookClientset.CephV1().CephBlockPools(updatedCephBlockPool.Namespace).Update(updatedCephBlockPool)
+	if err != nil {
+		logger.Errorf("Unable to update the cephBlockPool %s status %v", updatedCephBlockPool.GetName(), err)
+		return
+	}
 }

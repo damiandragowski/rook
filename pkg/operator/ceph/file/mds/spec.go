@@ -18,11 +18,10 @@ package mds
 
 import (
 	"fmt"
-	"strconv"
 
+	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
-	"github.com/rook/rook/pkg/operator/ceph/config"
 	opspec "github.com/rook/rook/pkg/operator/ceph/spec"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
@@ -57,6 +56,9 @@ func (c *Cluster) makeDeployment(mdsConfig *mdsConfig) *apps.Deployment {
 			PriorityClassName: c.fs.Spec.MetadataServer.PriorityClassName,
 		},
 	}
+	// Replace default unreachable node toleration
+	k8sutil.AddUnreachableNodeToleration(&podSpec.Spec)
+
 	if c.clusterSpec.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
@@ -104,20 +106,6 @@ func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig) v1.Container {
 		"--foreground",
 	)
 
-	// These flags are obsoleted as of Nautilus
-	if !c.clusterInfo.CephVersion.IsAtLeastNautilus() {
-		args = append(
-			args,
-			config.NewFlag("mds-standby-for-fscid", c.fsID),
-			config.NewFlag("mds-standby-replay", strconv.FormatBool(c.fs.Spec.MetadataServer.ActiveStandby)))
-	}
-
-	// Set mds cache memory limit to the best appropriate value
-	if !c.fs.Spec.MetadataServer.Resources.Limits.Memory().IsZero() {
-		mdsCacheMemoryLimit := float64(c.fs.Spec.MetadataServer.Resources.Limits.Memory().Value()) * mdsCacheMemoryLimitFactor
-		args = append(args, config.NewFlag("mds-cache-memory-limit", strconv.Itoa(int(mdsCacheMemoryLimit))))
-	}
-
 	container := v1.Container{
 		Name: "mds",
 		Command: []string{
@@ -146,7 +134,7 @@ func getMdsDeployments(context *clusterd.Context, namespace, fsName string) (*ap
 	fsLabelSelector := fmt.Sprintf("rook_file_system=%s", fsName)
 	deps, err := k8sutil.GetDeployments(context.Clientset, namespace, fsLabelSelector)
 	if err != nil {
-		return nil, fmt.Errorf("could not get deployments for filesystem %s (matching label selector '%s'): %+v", fsName, fsLabelSelector, err)
+		return nil, errors.Wrapf(err, "could not get deployments for filesystem %s (matching label selector %q)", fsName, fsLabelSelector)
 	}
 	return deps, nil
 }
@@ -158,7 +146,7 @@ func deleteMdsDeployment(context *clusterd.Context, namespace string, deployment
 	propagation := metav1.DeletePropagationForeground
 	options := &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod, PropagationPolicy: &propagation}
 	if err := context.Clientset.AppsV1().Deployments(namespace).Delete(deployment.GetName(), options); err != nil {
-		return fmt.Errorf("failed to delete mds deployment %s: %+v", deployment.GetName(), err)
+		return errors.Wrapf(err, "failed to delete mds deployment %s", deployment.GetName())
 	}
 	return nil
 }
